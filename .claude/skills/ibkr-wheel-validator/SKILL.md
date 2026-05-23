@@ -7,12 +7,20 @@ description: >
   "80% rule options", "wheel setup", or mentions DTE/delta/IV on equities/ETFs.
   Enforces IV Rank filter, DTE window, delta range, premium minimum, position sizing,
   and early-close 80-90% rule. Outputs GO / NO-GO with reasoning.
+  Automatically fetches options data from IBKR Client Portal via Claude in Chrome
+  when the user provides only a ticker — no manual data entry required.
 metadata:
   author: dnodal0
-  version: 1.0.0
+  version: 1.1.0
   broker: IBKR
   strategy: Wheel (CSP → CC)
   instruments: US equities, ETFs (SPY, QQQ, individual stocks)
+allowed-tools:
+  - mcp__Claude_in_Chrome__navigate
+  - mcp__Claude_in_Chrome__get_page_text
+  - mcp__Claude_in_Chrome__read_page
+  - mcp__Claude_in_Chrome__find
+  - mcp__Claude_in_Chrome__javascript_tool
 ---
 
 # IBKR Wheel Strategy Validator
@@ -25,17 +33,86 @@ Objectif : générer du premium régulier tout en accumulant des positions solid
 
 ---
 
+## Étape 0 : Récupération automatique des données via Chrome
+
+**Avant de demander quoi que ce soit à l'utilisateur**, tenter de récupérer les données
+directement depuis le Client Portal IBKR ouvert dans Chrome.
+
+### 0.1 — Vérifier si IBKR est ouvert
+
+```
+mcp__Claude_in_Chrome__navigate → https://clientportal.ibkr.com
+mcp__Claude_in_Chrome__get_page_text
+```
+
+Si la page retourne une page de login → demander à l'utilisateur de se connecter d'abord,
+puis relancer. Si déjà connecté → continuer.
+
+### 0.2 — Naviguer vers la chaîne d'options du ticker
+
+Une fois le ticker connu (demander UNIQUEMENT le ticker si rien n'est fourni) :
+
+```
+# Naviguer vers la page du ticker dans le portail
+mcp__Claude_in_Chrome__navigate → https://clientportal.ibkr.com/portal/#/trade/options?symbol=TICKER
+
+# Lire le contenu de la page
+mcp__Claude_in_Chrome__read_page
+```
+
+Extraire automatiquement depuis la page :
+- **Prix actuel** du sous-jacent
+- **Chaîne d'options** : strikes disponibles autour du prix actuel
+- **Premium bid/ask** pour chaque strike (calculer le mid)
+- **Delta** par strike
+- **DTE** par expiration disponible
+- **IV implicite** (pour estimer IV Rank si disponible)
+
+### 0.3 — Récupérer l'IV Rank depuis Market Chameleon
+
+Si IV Rank non disponible directement sur IBKR :
+
+```
+mcp__Claude_in_Chrome__navigate → https://marketchameleon.com/Overview/TICKER/IV/
+mcp__Claude_in_Chrome__get_page_text
+```
+
+Extraire : IV Rank 30 jours, IV actuelle, IV 52w high/low.
+
+### 0.4 — Récupérer les positions ouvertes (Early-close check)
+
+Pour vérifier si une position existante doit être fermée :
+
+```
+mcp__Claude_in_Chrome__navigate → https://clientportal.ibkr.com/portal/#/portfolio
+mcp__Claude_in_Chrome__get_page_text
+```
+
+Extraire : positions options ouvertes, prix d'entrée, P&L actuel, DTE restant.
+
+### 0.5 — Résumé de ce qui a été récupéré
+
+Afficher un résumé des données collectées avant de lancer la validation :
+
+```
+📡 Données récupérées depuis IBKR + MarketChameleon :
+  Ticker    : XXXX    Prix actuel : $XXX
+  Strike    : $XXX    DTE : XX j   Premium mid : $X.XX
+  Delta     : -0.XX   IV Rank : XX%
+  Source    : IBKR Client Portal + MarketChameleon
+```
+
+Si certaines données sont manquantes → demander uniquement celles-là à l'utilisateur.
+
+---
+
 ## Workflow de validation — OBLIGATOIRE avant toute exécution
 
 ### Étape 1 : Identifier le type de trade
 
-Demander à l'utilisateur :
-- Type : **CSP** (Cash-Secured Put) ou **CC** (Covered Call)
-- Ticker + prix actuel du sous-jacent
-- Strike envisagé
-- Expiration (date ou DTE)
-- Premium reçu (bid/mid)
-- IV Rank actuel (si connu)
+Si les données Chrome sont complètes, passer directement à l'étape 2.
+Sinon demander à l'utilisateur uniquement les données manquantes :
+- Type : **CSP** ou **CC**
 - Taille du compte allouée à ce sous-jacent
 
 ---
@@ -54,8 +131,6 @@ IV Rank = (IV actuelle - IV 52w low) / (IV 52w high - IV 52w low) × 100
 
 **RÈGLE** : IV Rank < 20 → BLOQUER (premium insuffisant vs risque)
 
-Si IV Rank non fourni : demander ou estimer via contexte (VIX, actualités récentes).
-
 ---
 
 ### Étape 3 : Filtre DTE (Days To Expiration)
@@ -66,9 +141,9 @@ Si IV Rank non fourni : demander ou estimer via contexte (VIX, actualités réce
 | CC   | 21–35 jours | 14–45 jours |
 
 **RÈGLES** :
-- DTE < 14 → ❌ BLOQUER (gamma risk trop élevé, peu de valeur temps restante)
-- DTE > 60 → ❌ BLOQUER (trop d'exposition temporelle, capital immobilisé)
-- DTE idéal : 30–45 jours (theta decay optimal, zone 45 DTE de Tastytrade)
+- DTE < 14 → ❌ BLOQUER (gamma risk trop élevé)
+- DTE > 60 → ❌ BLOQUER (capital immobilisé trop longtemps)
+- DTE idéal : 30–45 jours (theta decay optimal)
 
 ---
 
@@ -80,8 +155,8 @@ Si IV Rank non fourni : demander ou estimer via contexte (VIX, actualités réce
 | CC   | +0.20 à +0.30 | +0.15 à +0.35 |
 
 **RÈGLES** :
-- Delta > 0.35 (en valeur absolue) → ❌ Trop risqué, probabilité d'assignation trop haute
-- Delta < 0.15 → ❌ Premium trop faible, ROI insuffisant
+- Delta > 0.35 (valeur absolue) → ❌ Trop risqué
+- Delta < 0.15 → ❌ Premium insuffisant
 
 ---
 
@@ -92,20 +167,18 @@ premium_pct = premium_reçu / (strike × 100) × 100
 roi_mensuel = premium_pct × (30 / DTE)
 ```
 
-| ROI mensuel annualisé | Signal |
-|----------------------|--------|
-| ≥ 1.5% / mois        | ✅ Excellent |
-| 1.0–1.4% / mois      | ✅ Acceptable |
-| 0.7–0.9% / mois      | ⚠️ Faible mais OK en marché calme |
-| < 0.7% / mois        | ❌ BLOQUER — ne compense pas le risque |
+| ROI mensuel | Signal |
+|-------------|--------|
+| ≥ 1.5%      | ✅ Excellent |
+| 1.0–1.4%    | ✅ Acceptable |
+| 0.7–0.9%    | ⚠️ Faible mais OK en marché calme |
+| < 0.7%      | ❌ BLOQUER |
 
-**Objectif annuel** : 20–40% sur le capital alloué via accumulation de premium.
+**Objectif annuel** : 20–40% sur le capital alloué.
 
 ---
 
 ### Étape 6 : Strike vs Niveaux Techniques (CSP uniquement)
-
-Pour les CSPs, vérifier que le strike est sous un support technique solide :
 
 ```
 marge_sécurité = (prix_actuel - strike) / prix_actuel × 100
@@ -113,28 +186,22 @@ marge_sécurité = (prix_actuel - strike) / prix_actuel × 100
 
 | Marge | Signal |
 |-------|--------|
-| ≥ 5%  | ✅ Strike bien en dessous du prix actuel |
+| ≥ 5%  | ✅ |
 | 3–4%  | ⚠️ Acceptable si IV Rank élevé |
-| < 3%  | ❌ Strike trop proche du prix — risque d'assignation élevé |
-
-Demander : y a-t-il un support technique identifié sous le strike ?
+| < 3%  | ❌ Strike trop proche du prix |
 
 ---
 
 ### Étape 7 : Position Sizing
 
 ```
-capital_max_par_trade = min(
-  compte_total × 0.05,        # Max 5% du compte par position
-  strike × 100 × nb_contrats  # Exposition réelle
-)
-nb_contrats = floor(capital_alloué / (strike × 100))
+nb_contrats = floor(compte_total × 0.05 / (strike × 100))
 ```
 
 **RÈGLES** :
-- Max 5% du compte par sous-jacent en CSP
-- Max 3 positions simultanées en Wheel sur le même secteur (corrélation)
-- En CC après assignation : 1 contrat par 100 actions détenues
+- Max 5% du compte par sous-jacent
+- Max 3 positions simultanées dans le même secteur
+- En CC : 1 contrat par 100 actions détenues
 
 ---
 
@@ -144,24 +211,22 @@ nb_contrats = floor(capital_alloué / (strike × 100))
 profit_actuel = (premium_initial - premium_actuel) / premium_initial × 100
 ```
 
-| Profit réalisé | Action recommandée |
-|---------------|-------------------|
-| ≥ 80%         | ✅ FERMER la position — objectif atteint |
-| 50–79%        | 🔄 Surveiller, approcher du target |
-| < 50%         | ⏳ Laisser courir si DTE > 14 jours |
+| Profit réalisé | Action |
+|---------------|--------|
+| ≥ 80%         | ✅ FERMER immédiatement |
+| 50–79%        | 🔄 Surveiller |
+| < 50%         | ⏳ Laisser courir si DTE > 14j |
 
-**RÈGLE CRITIQUE** : Ne jamais laisser une option expirer pour capturer les derniers 10-20%
-de premium — le gamma risk explose dans les 7 derniers jours.
+**RÈGLE CRITIQUE** : Ne jamais attendre l'expiration pour les derniers 10-20% —
+le gamma risk explose dans les 7 derniers jours.
 
 ---
 
 ## Output du validateur
 
-Toujours afficher ce résumé :
-
 ```
 ╔══════════════════════════════════════════╗
-║      IBKR WHEEL VALIDATOR v1.0           ║
+║      IBKR WHEEL VALIDATOR v1.1           ║
 ╠══════════════════════════════════════════╣
 ║ Ticker       : XXXX                      ║
 ║ Type         : CSP / CC                  ║
@@ -173,6 +238,7 @@ Toujours afficher ce résumé :
 ║ ROI mensuel  : X.XX%  ✅/⚠️/❌          ║
 ║ Marge strike : X.XX%  ✅/⚠️/❌          ║
 ║ Contrats     : X (capital: $XXXX)        ║
+║ Source       : 🌐 IBKR Chrome / Manuel   ║
 ╠══════════════════════════════════════════╣
 ║ DÉCISION : ✅ TRADE VALIDÉ               ║
 ║         ou ❌ TRADE BLOQUÉ               ║
@@ -184,48 +250,51 @@ Si VALIDÉ → rappeler le target de close (80% du premium = $X.XX).
 
 ---
 
-## Exemples
+## Exemples d'invocation
 
-### Exemple 1 : CSP valide sur SPY
+### Mode automatique (Chrome ouvert sur IBKR)
 
-User : "SPY à 520$, vendre CSP strike 500, expiry 35 DTE, premium 2.80, IV Rank 42, compte 50k$"
+```
+/ibkr-wheel-validator NVDA CSP
+```
+→ Claude navigue sur IBKR, lit la chaîne d'options, récupère l'IV Rank sur
+  MarketChameleon, et lance la validation sans autre input.
 
-Calculs :
-1. IV Rank 42% ✅
-2. DTE 35j ✅
-3. Delta estimé ~-0.22 ✅
-4. Premium% = 2.80/(500×100)×100 = 0.56% → ROI mensuel = 0.56%×(30/35) = 0.48%/mois ⚠️ faible
-5. Marge = (520-500)/520 = 3.8% ⚠️
-6. Contrats = floor(50000×0.05/(500×100)) = floor(2500/50000) = 0 → 1 contrat max
+### Mode semi-automatique (Chrome dispo mais pas sur IBKR)
 
-Note : ROI faible en marché calme. Acceptable si SPY = conviction hold.
+```
+/ibkr-wheel-validator
+```
+→ Claude demande uniquement le ticker, puis va chercher le reste.
 
-Résultat : TRADE VALIDÉ (avec réserve sur ROI) — 1 contrat, close à $0.56 (80%)
+### Mode manuel (fallback si Chrome non disponible)
 
-### Exemple 2 : CSP bloqué — IV trop basse
+```
+/ibkr-wheel-validator
 
-User : "AAPL à 185$, CSP strike 180, 30 DTE, premium 0.90, IV Rank 15"
+CSP sur NVDA. Prix 875$, strike 820, 35 DTE, premium 4.20$,
+delta -0.24, IV Rank 38, compte 40 000$
+```
 
-IV Rank 15% ❌ → BLOQUÉ. Attendre spike IV (earnings, correction marché).
+### Early-close check automatique
 
-### Exemple 3 : Early close
-
-User : "J'ai vendu un CSP TSLA pour 3.50$ il y a 20 jours, il vaut maintenant 0.60$"
-
-Profit = (3.50-0.60)/3.50 = 82.9% ✅ → FERMER immédiatement. Target 80% atteint.
-Capital libéré pour un nouveau trade.
+```
+/ibkr-wheel-validator early-close
+```
+→ Claude lit le portfolio IBKR via Chrome, identifie toutes les positions
+  options ouvertes, et signale celles qui ont atteint le seuil 80%.
 
 ---
 
-## Checklist rapide avant exécution
+## Checklist rapide
 
 - [ ] IV Rank ≥ 20 (idéal ≥ 30)
 - [ ] DTE entre 21 et 60 jours (idéal 30-45)
 - [ ] Delta entre 0.15 et 0.35 (valeur absolue)
 - [ ] ROI mensuel ≥ 0.7%
-- [ ] Strike sous support technique (CSP) ou au-dessus résistance (CC)
+- [ ] Strike sous support technique (CSP)
 - [ ] Position ≤ 5% du compte
-- [ ] Pas d'earnings dans la fenêtre d'expiration (vérifier IBKR calendar)
+- [ ] Pas d'earnings dans la fenêtre d'expiration
 - [ ] Target early-close défini (80-90% du premium)
 
 ---
@@ -234,10 +303,9 @@ Capital libéré pour un nouveau trade.
 
 **Si assigné sur CSP** → tu détiens 100 actions au prix du strike
 1. Prix de revient effectif = strike - premium_reçu
-2. Vendre immédiatement une CC au strike = prix de revient (ou légèrement au-dessus)
+2. Vendre une CC au strike = prix de revient (ou légèrement au-dessus)
 3. Objectif CC : récupérer 1-2% supplémentaire
-4. Si actions remontent → close CC ou laisser expirer OTM
 
 **Si appelé sur CC** → actions vendues au strike
-1. Cycle terminé : calculer ROI total (premium CSP + premium CC + éventuelle plus-value)
-2. Recommencer le cycle sur ce ticker ou passer à un autre
+1. Calculer ROI total (premium CSP + premium CC + éventuelle PV)
+2. Recommencer le cycle
